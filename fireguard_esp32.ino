@@ -1,7 +1,7 @@
 /*
   FireGuard - Alarme incendie connectée (ESP32)
-  Capteurs : DHT11 (GPIO4), MQ-2 (GPIO34), Flame (GPIO27)
-  Sorties  : Buzzer actif (GPIO26), LED intégrée (GPIO2)
+  Capteurs : DHT11 (GPIO5), MQ-2 (GPIO34), Flame (GPIO27)
+  Sorties  : Buzzer (GPIO26), LED intégrée (GPIO2)
   Réseau   : Wi-Fi -> MQTT (TLS 1.2+) -> broker Mosquitto
 
   Bibliothèques (Gestionnaire de bibliothèques Arduino) :
@@ -18,20 +18,24 @@
 #include "secrets.h"
 
 // ---------- Options ----------
-#define USE_TLS 1            // 0 = MQTT en clair (port 1883) pour les premiers tests uniquement
+#define USE_TLS 0            // 0 = MQTT en clair (port 1883) pour les premiers tests uniquement
 
 // ---------- Broches ----------
-const int PIN_DHT    = 4;
+const int PIN_DHT    = 5;    // mets 4 si ton fil DATA/OUT est sur le GPIO 4
 const int PIN_GAS    = 34;   // ADC1 -> compatible Wi-Fi
 const int PIN_FLAME  = 27;
 const int PIN_BUZZER = 26;
 const int PIN_LED    = 2;    // LED intégrée
 
 // ---------- Seuils (à calibrer !) ----------
-const float TEMP_THRESHOLD   = 50.0;   // °C
-const int   GAS_THRESHOLD    = 1800;   // 0..4095 : regarde les valeurs au repos puis ajuste
-const unsigned long MQ_WARMUP_MS = 120000; // le MQ-2 chauffe 2 min : pas d'alarme gaz avant
-const bool  FLAME_ACTIVE_LOW = true;   // la plupart des modules mettent DO à LOW si flamme
+const float TEMP_THRESHOLD = 50.0;   // °C
+const int   GAS_DELTA      = 400;    // hausse au-dessus du repos qui déclenche l'alarme (0..4095)
+const int   GAS_CONFIRM_COUNT = 1;   // 6 x 500 ms = 3 s au-dessus du seuil avant alarme
+const unsigned long MQ_WARMUP_MS = 180000; // le MQ-2 chauffe 3 min : pas d'alarme gaz avant
+const bool  FLAME_ACTIVE_LOW  = true;      // la plupart des modules mettent DO à LOW si flamme
+
+// Buzzer PASSIF : il faut lui envoyer une fréquence (en Hz), pas juste un niveau HIGH
+const int BUZZER_FREQ = 2000;   // 1500 à 3000 Hz : change pour modifier la tonalité
 
 // ---------- MQTT ----------
 const char* DEVICE_ID    = "device1";
@@ -57,10 +61,35 @@ BuzzerMode mode = MODE_AUTO;
 
 float temperature = NAN, humidity = NAN;
 int   gasValue = 0;
+int   gasHighCount = 0;
+float gasBaseline = 0;
+bool  baselineReady = false;
 bool  flameDetected = false, gasHigh = false, tempHigh = false;
 bool  alarmActive = false, buzzerOn = false;
 
 unsigned long lastSensor = 0, lastPublish = 0, lastMqttTry = 0;
+
+// ---------- Buzzer passif (signal PWM à la fréquence voulue) ----------
+// Compatible avec le paquet ESP32 version 2.x et 3.x
+void buzzerInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_BUZZER, BUZZER_FREQ, 8);
+#else
+  ledcSetup(0, BUZZER_FREQ, 8);
+  ledcAttachPin(PIN_BUZZER, 0);
+#endif
+}
+
+void setBuzzer(bool on) {
+  static int state = -1;                 // évite de relancer le son à chaque lecture
+  if (state == (on ? 1 : 0)) return;
+  state = on ? 1 : 0;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(PIN_BUZZER, on ? BUZZER_FREQ : 0);
+#else
+  ledcWriteTone(0, on ? BUZZER_FREQ : 0);
+#endif
+}
 
 // ---------- HMAC-SHA256 (intégrité + authenticité du message) ----------
 String hmacSha256(const String& msg) {
@@ -142,14 +171,24 @@ void readFastSensors() {
   int f = digitalRead(PIN_FLAME);
   flameDetected = FLAME_ACTIVE_LOW ? (f == LOW) : (f == HIGH);
 
+  // Gaz : détection relative : on compare à une valeur de repos (référence) qui suit
+  // lentement les dérives du capteur, mais pas les hausses rapides dues à un vrai gaz.
   bool warmedUp = millis() > MQ_WARMUP_MS;
-  gasHigh  = warmedUp && (gasValue > GAS_THRESHOLD);
+  if (warmedUp) {
+    if (!baselineReady) { gasBaseline = gasValue; baselineReady = true; }
+    if (gasValue < gasBaseline + GAS_DELTA)
+      gasBaseline = 0.995 * gasBaseline + 0.005 * gasValue;
+  }
+  if (baselineReady && gasValue > gasBaseline + GAS_DELTA) gasHighCount++;
+  else gasHighCount = 0;
+  gasHigh = (gasHighCount >= GAS_CONFIRM_COUNT);
+
   tempHigh = !isnan(temperature) && (temperature > TEMP_THRESHOLD);
 
   alarmActive = flameDetected || gasHigh || tempHigh;
 
   buzzerOn = (mode == MODE_FORCE_ON) || (mode == MODE_AUTO && alarmActive);
-  digitalWrite(PIN_BUZZER, buzzerOn ? HIGH : LOW);
+  setBuzzer(buzzerOn);
   digitalWrite(PIN_LED, alarmActive ? HIGH : LOW);
 }
 
@@ -178,18 +217,19 @@ void publishData() {
   String payload = String(body) + "|" + hmacSha256(String(body));
 
   bool ok = mqtt.publish(TOPIC_DATA, payload.c_str());
-  Serial.printf("[%s] T=%s H=%s gaz=%d flamme=%d alarme=%d buzzer=%d\n",
-                ok ? "OK" : "ERR", t.c_str(), h.c_str(), gasValue,
+  Serial.printf("[%s] T=%s H=%s gaz=%d (ref=%d) flamme=%d alarme=%d buzzer=%d\n",
+                ok ? "OK" : "ERR", t.c_str(), h.c_str(), gasValue, (int)gasBaseline,
                 flameDetected, alarmActive, buzzerOn);
 }
 
 // ---------- Arduino ----------
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n=== FireGuard v3 (gaz relatif + buzzer passif) ===");
   pinMode(PIN_FLAME, INPUT);
-  pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
+  buzzerInit();
+  setBuzzer(false);               // buzzer coupé au démarrage
   analogReadResolution(12);
   dht.begin();
 
